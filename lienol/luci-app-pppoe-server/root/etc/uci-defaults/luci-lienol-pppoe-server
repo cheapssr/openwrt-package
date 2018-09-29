@@ -1,0 +1,11 @@
+#!/bin/sh
+
+uci -q batch <<-EOF >/dev/null
+	delete ucitrack.@rp-pppoe-server[-1]
+	add ucitrack rp-pppoe-server
+	set ucitrack.@rp-pppoe-server[-1].init=rp-pppoe-server
+	commit ucitrack
+EOF
+
+rm -f /tmp/luci-indexcache
+exit 0

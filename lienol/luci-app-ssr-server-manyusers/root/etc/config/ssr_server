@@ -1,0 +1,13 @@
+
+config server
+	option timeout '300'
+	option fast_open 'true'
+	option encrypt_method 'none'
+	option protocol 'auth_chain_a'
+	option obfs 'tls1.2_ticket_fastauth'
+	option enable '0'
+
+config users
+	option enabled '1'
+	option password 'test'
+	option port '60000'

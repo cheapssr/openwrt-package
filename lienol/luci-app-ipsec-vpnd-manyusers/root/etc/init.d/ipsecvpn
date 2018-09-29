@@ -1,0 +1,112 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (C) 2018 Lienol <lienol@qq.com>
+#
+
+START=99
+
+start()
+{
+	local vt_enabled=`uci get ipsec.@service[0].enabled 2>/dev/null`
+	local vt_clientip=`uci get ipsec.@service[0].clientip`
+	local vt_clientdns=`uci get ipsec.@service[0].clientdns`
+	local vt_secret=`uci get ipsec.@service[0].secret 2>/dev/null`
+	local vt_export_interface=`uci get ipsec.@service[0].export_interface 2>/dev/null`
+
+	# -----------------------------------------------------------------
+	if [ "$vt_enabled" = 0 ]; then
+    /etc/init.d/ipsec disable && /etc/init.d/ipsec stop
+		echo "WARNING: IPSec VPN is disabled."
+		return 1
+	fi
+
+	cat > /etc/ipsec.conf <<EOF
+# ipsec.conf - strongSwan IPsec configuration file
+
+# basic configuration
+
+config setup
+    # strictcrlpolicy=yes
+    uniqueids=never
+
+# Add connections here.
+
+conn xauth_psk
+	keyexchange=ikev1
+	ike=aes128-sha1-modp2048,aes128-sha1-modp1024,3des-sha1-modp1024,3des-sha1-modp1536
+  esp=aes128-sha1,3des-sha1
+	left=%defaultroute
+	leftauth=psk
+	leftsubnet=0.0.0.0/0
+	right=%any
+	rightauth=psk
+	rightauth2=xauth
+	rightsourceip=$vt_clientip
+	rightdns=$vt_clientdns
+	auto=add
+EOF
+
+	cat > /etc/ipsec.secrets <<EOF
+# /etc/ipsec.secrets - strongSwan IPsec secrets file
+: PSK "$vt_secret"
+EOF
+
+	config_load ipsec
+	config_foreach setup_login login
+	/etc/init.d/ipsec enable && /etc/init.d/ipsec start
+	if [ "$vt_export_interface" != "none" ];then
+		iptables -t nat -A POSTROUTING -s ${vt_clientip%.*}.0/24 -o ${vt_export_interface} -m comment --comment "Rule For IPSec VPN Server" -j MASQUERADE
+		iptables -A forwarding_rule -s ${vt_clientip%.*}.0/24 -m comment --comment "Rule For IPSec VPN Server" -j ACCEPT
+	fi
+	echo "IPSec VPN is Started."
+}
+
+stop() {
+	ipsec_server_nums=`iptables -t nat -L POSTROUTING 2> /dev/null|grep -c "Rule For IPSec VPN Server"`
+	if [ -n "$ipsec_server_nums" ]; then
+		until [ "$ipsec_server_nums" = 0 ]
+		do
+			rules=`iptables -t nat -L POSTROUTING --line-num 2> /dev/null|grep "Rule For IPSec VPN Server" |awk '{print $1}'`
+			for rule in $rules
+			do
+					iptables -t nat -D POSTROUTING $rule 2> /dev/null
+					break
+			done
+			ipsec_server_nums=`expr $ipsec_server_nums - 1`
+		done
+	fi
+	nums2=`iptables -L forwarding_rule 2> /dev/null|grep -c "Rule For IPSec VPN Server"`
+	if [ -n "$nums2" ]; then
+		until [ "$nums2" = 0 ]
+		do
+			rules=`iptables -L forwarding_rule --line-num 2> /dev/null|grep "Rule For IPSec VPN Server" |awk '{print $1}'`
+			for rule in $rules
+			do
+					iptables -D forwarding_rule $rule 2> /dev/null
+					break
+			done
+			nums2=`expr $nums2 - 1`
+		done
+	fi
+	/etc/init.d/ipsec disable && /etc/init.d/ipsec stop
+	echo "IPSec VPN is Stopped."
+}
+
+restart() {
+  stop
+  start
+}
+
+setup_login() {
+	local section="$1"
+
+	## Code by VPN Server ##
+	config_get enabled "$section" enabled
+	[ "$enabled" -eq 0 ] && return 0
+	config_get username "$section" username
+	config_get password "$section" password
+	[ -n "$username" ] || return 0
+	[ -n "$password" ] || return 0
+	echo "$username : XAUTH '$password'" >> /etc/ipsec.secrets
+}
+

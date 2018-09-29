@@ -1,0 +1,38 @@
+<%#
+ Copyright 2018 Lienol
+ Licensed to the public under the Apache License 2.0.
+-%>
+
+<%
+local dsp = require "luci.dispatcher"
+-%>
+
+<% include("cbi/map") %>
+<script type="text/javascript">//<![CDATA[
+	var ss_redir_status = document.getElementById('_ss_redir_status');
+	var haproxy_status = document.getElementById('_haproxy_status');
+	var kcp_status = document.getElementById('_kcp_status');
+	var china_status = document.getElementById('_china_status');
+	var foreign_status = document.getElementById('_foreign_status');
+	XHR.poll(10, '<%=dsp.build_url("admin/vpn/passwall/ss_status")%>', null,
+		function(x, json) {
+			if (x && x.status == 200) {
+				ss_redir_status.innerHTML = json.ss_redir_status ? '<font color=green><%:RUNNING%> ✓</font>' : '<font color=red><%:NOT RUNNING%> X</font>';
+				haproxy_status.innerHTML = json.haproxy_status ? '<font color=green><%:RUNNING%> ✓</font>' : '<font color=red><%:NOT RUNNING%> X</font>';
+				kcp_status.innerHTML = json.kcp_status ? '<font color=green><%:RUNNING%> ✓</font>' : '<font color=red><%:NOT RUNNING%> X</font>';
+				china_status.innerHTML = json.china_status ? '<font color=green><%:Working...%> ✓</font>' : '<font color=red><%:Problem detected!%> X</font>';
+				foreign_status.innerHTML = json.foreign_status ? '<font color=green><%:Working...%> ✓</font>' : '<font color=red><%:Problem detected!%> X</font>';
+			}
+		});
+	var pings = document.getElementsByClassName('pingtime');
+	for(var i = 0; i<pings.length; i++)
+	{
+		XHR.get('<%=dsp.build_url("admin/vpn/passwall/ping")%>', {index: i, domain: pings[i].getAttribute("hint")},
+			function(x, result)
+			{
+				pings[result.index].innerHTML = (result.ping?result.ping:"--") + " ms";
+			}
+		);
+	}
+//]]></script>
+</script>

@@ -1,0 +1,1649 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (C) 2015 OpenWrt-dist
+# Copyright (C) 2016 fw867 <ffkykzs@gmail.com>
+# Copyright (C) 2016 Chen RuiWei <crw@gmail.com>
+# Copyright (C) 2018 Lienol <lienol@qq.com>
+
+# This is free software, licensed under the GNU General Public License v3.
+# See /LICENSE for more information.
+#
+
+START=99
+STOP=15
+
+CONFIG=passwall
+CONFIG_FILE=/var/etc/$CONFIG.json
+LOCK_FILE=/var/lock/$CONFIG.lock
+lb_FILE=/var/etc/haproxy.cfg
+LOG_FILE=/var/log/$CONFIG.log
+SS_PATH=/usr/share/$CONFIG
+SS_PATH_RULE=$SS_PATH/rule
+SS_PATH_DNSMASQ=$SS_PATH/dnsmasq.d
+TMP_DNSMASQ_PATH=/var/dnsmasq.d
+DNSMASQ_PATH=/etc/dnsmasq.d
+lanip=$(uci get network.lan.ipaddr)
+ip_prefix_hex=$(echo $lanip | awk -F "." '{printf ("0x%02x", $1)} {printf ("%02x", $2)} {printf ("%02x", $3)} {printf ("00/0xffffff00")}')
+#Route_FILE=/tmp/ssroute
+
+find_bin(){
+	name=$1
+	result=`find /usr/bin -iname "$name" -type f`
+	[ "$result" = "" ] && result=`find /usr/sbin -iname "$name" -type f`
+	if [ -z "$result" ]; then
+		echo ""
+	else
+		echo "$result"
+	fi
+}
+
+config_n_get() {
+	local ret=$(uci get $CONFIG.$1.$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+config_t_get() {
+	local index=0
+	[ -n "$4" ] && index=$4
+	local ret=$(uci get $CONFIG.@$1[$index].$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+factor(){
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		echo ""
+	else
+		echo "$2 $1"
+	fi
+}
+
+get_jump_mode(){
+	case "$1" in
+		disable)
+			echo "j"
+		;;
+		*)
+			echo "g"
+		;;
+	esac
+}
+
+get_comp_mode(){
+	case "$1" in
+		0)
+			echo "--nocomp"
+		;;
+		1)
+			echo ""
+		;;
+	esac
+}
+
+start_kcptun() {
+	kcptun_bin=$1
+	if [ -z "$kcptun_bin" ]; then
+		echo "$(date): 找不到Kcptun客户端主程序，无法启用！！！" >> $LOG_FILE
+	else
+		$kcptun_bin -l 127.0.0.1:11183 -r $2:$3 $4 >/dev/null 2>&1 &
+	fi
+}
+
+GLOBAL_SERVER=$(config_t_get global global_server nil)
+
+get_plugin_config() {
+	local plugin=$(config_get $1 plugin)
+	local plugin_opts=$(config_get $1 plugin_opts)
+	if [ -n "$plugin" -a -n "$plugin_opts" ]; then
+		echo $plugin >>/var/run/ss-plugin
+		echo "
+    \"plugin\": \"$plugin\",
+    \"plugin_opts\": \"$plugin_opts\","
+	fi
+}
+
+gen_config_file() {
+echo "$(date): =============================================================================================" >> $LOG_FILE
+echo "$(date):                                                                           开始运行Shadowsocks" >> $LOG_FILE
+echo "$(date): =============================================================================================" >> $LOG_FILE
+echo "$(date): 载入模式：$PROXY_MODE" >> $LOG_FILE
+	local SSTYPE USE_KCP KCP_PORT KCP_CONFIG
+	config_get SSTYPE $1 server_type 0
+	config_get LOCAL_PORT $1 local_port 1080
+	let SOCKS_PORT=LOCAL_PORT+1
+	vpsip=$(config_get $1 server)
+	ori_vpsip=$vpsip
+	use_ipv6=$(config_get $1 use_ipv6)
+	forwarding_ipv6=$(config_get $1 forwarding_ipv6)
+	parsing_ip=$(config_get $1 parsing_ip)
+	isip=""
+	if [ "$parsing_ip" == "1" ];then
+		if [ "$use_ipv6" == "1" ];then
+			isip=`echo $vpsip | grep -E "([[a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7}])"`
+			if [ -n "$isip" ];then
+				isip=`echo $vpsip | cut -d '[' -f2 | cut -d ']' -f1`
+			else
+				isip=`echo $vpsip | grep -E "([a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7})"`
+			fi
+		else
+			isip=`echo $vpsip|grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}"`
+		fi
+		if [ -z "$isip" ];then
+			echo "$(date): 检测到你的$SSTYPE服务器为域名，尝试解析...">> $LOG_FILE
+			vpsrip=""
+			if [ "$use_ipv6" == "1" ];then
+				vpsrip=`resolveip -6 -t 2 $vpsip|awk 'NR==1{print}'`
+				[ -z "$vpsrip" ] && vpsrip=`dig @208.67.222.222 $vpsip AAAA 2>/dev/null |grep 'IN'|awk -F ' ' '{print $5}'|grep -E "([a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7})"|head -n1`
+			else
+				vpsrip=`resolveip -4 -t 2 $vpsip|awk 'NR==1{print}'`
+				[ -z "$vpsrip" ] && vpsrip=`dig @208.67.222.222 $vpsip 2>/dev/null |grep 'IN'|awk -F ' ' '{print $5}'|grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}"|head -n1`
+			fi
+			vpsip=$vpsrip
+		fi
+	fi
+	if [ "$SSTYPE" == "v2ray" ]; then
+		echo "$(date): V2ray服务器ip地址:$vpsip">> $LOG_FILE
+		echo "$(date): 生成V2ray配置文件" >> $LOG_FILE
+		mux=$(config_get $1 v2ray_mux)
+		if [ "$mux" == "1" ];then
+			mux=true
+		else mux=false
+		fi
+  	cat <<-EOF >$CONFIG_FILE
+{
+	"log": {
+		"loglevel": "warning"
+	},
+	"inbound": {
+		"listen": "0.0.0.0",
+		"port": $SOCKS_PORT,
+		"protocol": "socks",
+		"settings": {
+			"auth": "noauth",
+			"udp": true,
+			"ip": "127.0.0.1"
+		}
+	},
+	"inboundDetour": [{
+		"port": "$LOCAL_PORT",
+		"listen": "0.0.0.0",
+		"protocol": "dokodemo-door",
+		"settings": {
+			"network": "tcp,udp",
+			"timeout": 300,
+			"followRedirect": true
+		}
+	}],
+	"outboundDetour": [{
+		"protocol": "freedom",
+		"settings": {
+			
+		},
+		"tag": "direct"
+	}],
+	"outbound": {
+		"protocol": "vmess",
+		"settings": {
+			"vnext": [{
+				"address": "$ori_vpsip",
+				"port": $(config_get $1 server_port),
+				"users": [{
+					"id": "$(config_get $1 v2ray_id)",
+					"level": 1,
+					"alterId": $(config_get $1 v2ray_alterId)
+				}]
+			}]
+		},
+		"mux": {"enabled": $mux},
+		"streamSettings": {
+EOF
+		tls=$(config_get $1 v2ray_tls)
+		if [ "$tls" == "1" ];then
+		cat >> $CONFIG_FILE <<-EOF
+			"security": "tls",
+EOF
+		fi
+		net_type=$(config_get $1 v2ray_network_type)
+		if [ "$net_type" == "tcp" ];then
+		cat >> $CONFIG_FILE <<-EOF
+			"network": "tcp"
+		}
+EOF
+		elif [ "$net_type" == "kcp" ];then
+			kcp_obfs=$(config_get $1 v2ray_kcp_obfs)
+			kcp_mtu=$(config_get $1 v2ray_kcp_mtu)
+			kcp_tti=$(config_get $1 v2ray_kcp_tti)
+			kcp_uplinkCapacity=$(config_get $1 v2ray_kcp_uplinkCapacity)
+			kcp_downlinkCapacity=$(config_get $1 v2ray_kcp_downlinkCapacity)
+			kcp_readBufferSize=$(config_get $1 v2ray_kcp_readBufferSize)
+			kcp_writeBufferSize=$(config_get $1 v2ray_kcp_writeBufferSize)
+			kcp_congestion=$(config_get $1 v2ray_kcp_congestion)
+			if [ "$kcp_congestion" == "1" ];then
+				kcp_congestion=true
+			else kcp_congestion=false
+			fi
+			cat >> $CONFIG_FILE <<-EOF
+			"network": "mkcp",
+			"kcpSettings": {
+				"mtu": $kcp_mtu,
+				"tti": $kcp_tti,
+				"uplinkCapacity": $kcp_uplinkCapacity,
+				"downlinkCapacity": $kcp_downlinkCapacity,
+				"congestion": $kcp_congestion,
+				"readBufferSize": $kcp_readBufferSize,
+				"writeBufferSize": $kcp_writeBufferSize,
+				"header": {
+					"type": "$kcp_obfs"
+				}
+			}
+		}
+EOF
+		elif [ "$net_type" == "ws" ];then
+			ws_path=$(config_get $1 v2ray_ws_path)
+			ws_header=$(config_get $1 v2ray_ws_header)
+			cat >> $CONFIG_FILE <<-EOF
+			"network": "ws",
+			"wsSettings": {
+				"path": "$ws_path"
+			}
+		}
+EOF
+		fi
+	
+		cat >> $CONFIG_FILE <<-EOF
+	}
+}
+EOF
+	else
+	config_get USE_KCP $1 use_kcp 0
+	config_get KCP_SERVER $1 kcp_server
+	config_get KCP_PORT $1 kcp_port 1185
+	config_get KCP_CONFIG $1 kcp_opts
+	config_get KCP_USE_IPV6 $1 kcp_use_ipv6
+	config_get KCP_Parsing_IP $1 kcp_parsing_ip
+	lbenabled=$(config_t_get global balancing_enable 0)
+	USEKCP=$USE_KCP
+	kcptun_path=""
+	echo "$(date): Shadowsocks服务器ip地址:$vpsip">> $LOG_FILE
+	if [ "$USE_KCP" == "1" ] && ([ -z "$KCP_PORT" ] || [ -z "$KCP_CONFIG" ]); then
+		echo "$(date): 【检测到启用KCP，但未配置KCP参数】，跳过~">> $LOG_FILE
+	fi
+	if [ "$USE_KCP" == "1" -a -n "$KCP_PORT" -a -n "$KCP_CONFIG" -a "$lbenabled" == "1" ];then
+		echo "$(date): 【检测到启用KCP，但KCP与负载均衡二者不能同时开启】，跳过~">> $LOG_FILE
+	fi
+	
+	if [ -f "$(config_t_get global kcptun_client_file)" ];then
+		kcptun_path=$(config_t_get global kcptun_client_file)
+	else
+		temp=$(find_bin kcptun_client)
+		[ -n "$temp" ] && {
+			kcptun_path=$temp
+		}
+	fi
+	
+	if [ "$USE_KCP" == "1" -a -z "$kcptun_path" ] && ([ -n "$KCP_PORT" ] || [ -n "$KCP_CONFIG" ]);then
+		echo "$(date): 【检测到启用KCP，但未安装KCP主程序，请自行到自动更新下载KCP】，跳过~">> $LOG_FILE
+	fi
+if [ "$USE_KCP" == "1" -a -n "$KCP_PORT" -a -n "$KCP_CONFIG" -a "$lbenabled" == "0" -a -n "$kcptun_path" ];then
+  echo "$(date): 运行kcptun_client..." >> $LOG_FILE
+  if [ -z "$KCP_SERVER" ]; then
+	echo "$(date): KCP服务器：$vpsip" >> $LOG_FILE
+	start_kcptun "$kcptun_path" $vpsip $KCP_PORT "$KCP_CONFIG"
+  else
+	if [ "$KCP_Parsing_IP" == "1" ];then
+		if [ "$KCP_USE_IPV6" == "1" ];then
+			isip=`echo $KCP_SERVER | grep -E "([[a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7}])"`
+			if [ -n "$isip" ];then
+				isip=`echo $KCP_SERVER | cut -d '[' -f2 | cut -d ']' -f1`
+			else
+				isip=`echo $KCP_SERVER | grep -E "([a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7})"`
+			fi
+		else
+			isip=`echo $KCP_SERVER|grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}"`
+		fi
+		if [ -z "$isip" ];then
+			echo "$(date): 检测到你的KCP服务器为域名，尝试解析...">> $LOG_FILE
+			kcprip=""
+			if [ "$use_ipv6" == "1" ];then
+				kcprip=`resolveip -6 -t 2 $KCP_SERVER|awk 'NR==1{print}'`
+				[ -z "$kcprip" ] && kcprip=`dig @208.67.222.222 $KCP_SERVER AAAA 2>/dev/null |grep 'IN'|awk -F ' ' '{print $5}'|grep -E "([a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7})"|head -n1`
+			else
+				kcprip=`resolveip -4 -t 2 $KCP_SERVER|awk 'NR==1{print}'`
+				[ -z "$kcprip" ] && kcprip=`dig @208.67.222.222 $vpsip 2>/dev/null |grep 'IN'|awk -F ' ' '{print $5}'|grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}"|head -n1`
+			fi
+			KcpServer=$kcprip
+		fi
+		echo "$(date): KCP服务器：$KcpServer" >> $LOG_FILE
+		start_kcptun "$kcptun_path" $KcpServer $KCP_PORT "$KCP_CONFIG"
+	else
+		echo "$(date): KCP服务器：$KCP_SERVER" >> $LOG_FILE
+		start_kcptun "$kcptun_path" $KCP_SERVER $KCP_PORT "$KCP_CONFIG"
+	fi
+  fi
+  if [ "$SSTYPE" == "ss" ]; then
+    echo "$(date): 生成KCP加速shadowsocks配置文件" >> $LOG_FILE
+    ssbin="ss"
+    cat <<-EOF >$CONFIG_FILE
+				{
+					"server": "127.0.0.1",
+					"_comment": "$ori_vpsip",
+					"server_port": 11183,
+					"local_address": "0.0.0.0",$(get_plugin_config $1)
+					"local_port": $LOCAL_PORT,
+					"password": "$(config_get $1 password)",
+					"timeout": $(config_get $1 timeout),
+					"method": "$(config_get $1 encrypt_method)",
+					"fast_open": $(config_get $1 fast_open),
+					"reuse_port": true
+				}
+EOF
+      else
+		 echo "$(date): 生成KCP加速shadowsocksR配置文件" >> $LOG_FILE
+		 ssbin="ssr"
+			cat <<-EOF >$CONFIG_FILE
+				{
+					"server": "127.0.0.1",
+					"_comment": "$ori_vpsip",
+					"server_port": 11183,
+					"local_address": "0.0.0.0",
+					"local_port": $LOCAL_PORT,
+					"password": "$(config_get $1 password)",
+					"timeout": $(config_get $1 timeout),
+					"method": "$(config_get $1 encrypt_method)",
+					"protocol": "$(config_get $1 protocol)",
+					"protocol_param": "$(config_get $1 protocol_param)",
+					"obfs": "$(config_get $1 obfs)",
+					"obfs_param": "$(config_get $1 obfs_param)",
+					"fast_open": $(config_get $1 fast_open)
+				}
+EOF
+	fi
+else
+  if [ "$SSTYPE" == "ss" ]; then
+      echo "$(date): 生成shadowsocks配置文件" >> $LOG_FILE
+      ssbin="ss"
+  	cat <<-EOF >$CONFIG_FILE
+		{
+		    "server": "$vpsip",
+		    "_comment": "$ori_vpsip",
+		    "server_port": $(config_get $1 server_port),
+		    "local_address": "0.0.0.0",$(get_plugin_config $1)
+		    "local_port": $LOCAL_PORT,
+		    "password": "$(config_get $1 password)",
+		    "timeout": $(config_get $1 timeout),
+		    "method": "$(config_get $1 encrypt_method)",
+		    "fast_open": $(config_get $1 fast_open),
+			"reuse_port": true
+		}
+EOF
+  else
+    echo "$(date): 生成shadowsocksR配置文件" >> $LOG_FILE
+    ssbin="ssr"
+    cat <<-EOF >$CONFIG_FILE
+		{
+		    "server": "$vpsip",
+		    "_comment": "$ori_vpsip",
+		    "server_port": $(config_get $1 server_port),
+		    "local_address": "0.0.0.0",
+		    "local_port": $LOCAL_PORT,
+		    "password": "$(config_get $1 password)",
+		    "timeout": $(config_get $1 timeout),
+		    "method": "$(config_get $1 encrypt_method)",
+		    "protocol": "$(config_get $1 protocol)",
+		    "protocol_param": "$(config_get $1 protocol_param)",
+		    "obfs": "$(config_get $1 obfs)",
+		    "obfs_param": "$(config_get $1 obfs_param)",
+		    "fast_open": $(config_get $1 fast_open)
+		}
+EOF
+	fi
+  fi
+fi
+
+}
+
+load_config() {
+	if [ "$GLOBAL_SERVER" == "nil" ]; then
+    echo "$(date): Shadowsocks没有开启！" >> $LOG_FILE
+		return 1
+	fi
+	PROXY_MODE=$(config_t_get global proxy_mode gfwlist)
+	DNS_MODE=$(config_t_get global dns_mode ChinaDNS)
+	UP_DNS_MODE=$(config_t_get global up_dns_mode OpenDNS)
+	DNS_FORWARD=$(config_t_get global dns_forward 208.67.222.222:443)
+	DNS_FORWARD_IP=$(echo "$DNS_FORWARD" | awk -F':' '{print $1}')
+	DNS_FORWARD_PORT=$(echo "$DNS_FORWARD" | awk -F':' '{print $2}')
+	DNS1=$(config_t_get global dns_1)
+	config_load $CONFIG
+	gen_config_file $GLOBAL_SERVER
+	return 0
+}
+
+start_redir() {
+	config_load $CONFIG
+	config_get SSTYPE $GLOBAL_SERVER server_type
+	mkdir -p /var/run /var/etc
+	if [ "$SSTYPE" == "v2ray" ]; then
+		v2ray_bin=$(find_bin v2ray)
+		if [ -z "$v2ray_bin" ]; then
+			echo "$(date): 找不到V2ray主程序，无法启用！！！" >> $LOG_FILE
+			uci set $CONFIG.@global[0].global_server=nil && uci commit $CONFIG
+		else
+			$v2ray_bin -config=$CONFIG_FILE > /var/log/v2ray.log &
+			echo "$(date): 运行 V2ray" >> $LOG_FILE
+		fi
+	else
+		ss_bin=$(find_bin "$ssbin"-redir)
+		if [ -z "$ss_bin" ]; then
+			echo "$(date): 找不到SS主程序，无法启用！！！" >> $LOG_FILE
+			uci set $CONFIG.@global[0].global_server=nil && uci commit $CONFIG
+		else
+			$ss_bin \
+			-c $CONFIG_FILE \
+			-u \
+			-b 0.0.0.0 -b :: \
+			-f /var/run/$ssbin-redir.pid
+			echo "$(date): 运行 $ssbin-redir" >> $LOG_FILE
+		fi
+	fi
+}
+
+clean_log() {
+#rm -f $LOG_FILE >/dev/null 2>&1 &
+logsnum=$(cat $LOG_FILE 2>/dev/null | wc -l)
+if [ "$logsnum" -gt 200 ];then
+	rm -f $LOG_FILE >/dev/null 2>&1 &
+	echo "$(date): 日志文件过长，清空处理！" >> $LOG_FILE
+fi
+}
+
+stop_cru() {
+	sed -i "/$CONFIG/d" /etc/crontabs/root >/dev/null 2>&1 &
+	#sed -i "/reconnection.sh/d" /etc/crontabs/root >/dev/null 2>&1 &
+	#sed -i "/ssruleupdate.sh/d" /etc/crontabs/root >/dev/null 2>&1 &
+	#sed -i "/onlineconfig.sh/d" /etc/crontabs/root >/dev/null 2>&1 &
+	echo "$(date): 清理自动更新规则。" >> $LOG_FILE
+}
+
+set_cru() {
+autoupdate=$(config_t_get global auto_update)
+weekupdate=$(config_t_get global week_update)
+dayupdate=$(config_t_get global time_update)
+autoupdatesubscribe=$(config_t_get global auto_update_subscribe)
+weekupdatesubscribe=$(config_t_get global week_update_subscribe)
+dayupdatesubscribe=$(config_t_get global time_update_subscribe)
+if [ "$autoupdate" = "1" ];then
+  if [ "$weekupdate" = "7" ];then
+      echo "0 $dayupdate * * * $SS_PATH/ssruleupdate.sh" >> /etc/crontabs/root
+      echo "$(date): 设置自动更新GFWList规则在每天 $dayupdate 点。" >> $LOG_FILE
+   else
+      echo "0 $dayupdate * * $weekupdate $SS_PATH/ssruleupdate.sh" >> /etc/crontabs/root
+      echo "$(date): 设置自动更新GFWList规则在星期 $weekupdate 的 $dayupdate 点。" >> $LOG_FILE
+   fi
+else
+	sed -i '/ssruleupdate.sh/d' /etc/crontabs/root >/dev/null 2>&1 &
+fi
+
+if [ "$autoupdatesubscribe" = "1" ];then
+  if [ "$weekupdatesubscribe" = "7" ];then
+      echo "0 $dayupdatesubscribe * * * $SS_PATH/onlineconfig.sh" >> /etc/crontabs/root
+      echo "$(date): 设置服务器订阅自动更新规则在每天 $dayupdatesubscribe 点。" >> $LOG_FILE
+   else
+      echo "0 $dayupdatesubscribe * * $weekupdate $SS_PATH/onlineconfig.sh" >> /etc/crontabs/root
+      echo "$(date): 设置服务器订阅自动更新规则在星期 $weekupdate 的 $dayupdatesubscribe 点。" >> $LOG_FILE
+   fi
+else
+	sed -i '/onlineconfig.sh/d' /etc/crontabs/root >/dev/null 2>&1 &
+fi
+}
+
+auto_stop() {
+	auto_on=$(config_t_get global auto_on)
+	if [ "$auto_on" = "0" ];then
+		sed -i '/$CONFIG stop/d' /etc/crontabs/root >/dev/null 2>&1 &
+		sed -i '/$CONFIG start/d' /etc/crontabs/root >/dev/null 2>&1 &
+		sed -i '/$CONFIG restart/d' /etc/crontabs/root >/dev/null 2>&1 &
+	fi
+	disconnect_reconnect_on=$(config_t_get global disconnect_reconnect_on)
+	if [ "$disconnect_reconnect_on" = "0" ];then
+		sed -i '$SS_PATH/reconnection.sh/d' /etc/crontabs/root >/dev/null 2>&1 &
+	fi
+	/etc/init.d/cron restart
+	echo "$(date): 清理定时自动开关设置。" >> $LOG_FILE
+}
+
+auto_start() {
+	auto_on=$(config_t_get global auto_on)
+	sed -i '/$CONFIG/d' /etc/crontabs/root >/dev/null 2>&1 &
+	if [ "$auto_on" = "1" ];then
+		time_off=$(config_t_get global time_off)
+		time_on=$(config_t_get global time_on)
+		time_restart=$(config_t_get global time_restart)
+		[ -z "$time_off" -o "$time_off" != "nil" ] && {
+			echo "0 $time_off * * * /etc/init.d/$CONFIG stop" >> /etc/crontabs/root
+			echo "$(date): 设置自动关闭在每天 $time_off 点。" >> $LOG_FILE
+		}
+		[ -z "$time_on" -o "$time_on" != "nil" ] && {
+			echo "0 $time_on * * * /etc/init.d/$CONFIG start" >> /etc/crontabs/root
+			echo "$(date): 设置自动开启在每天 $time_on 点。" >> $LOG_FILE
+		}
+		[ -z "$time_restart" -o "$time_restart" != "nil" ] && {
+			echo "0 $time_restart * * * /etc/init.d/$CONFIG restart" >> /etc/crontabs/root
+			echo "$(date): 设置自动重启在每天 $time_restart 点。" >> $LOG_FILE
+		}
+	fi
+	
+	disconnect_reconnect_on=$(config_t_get global disconnect_reconnect_on)
+	if [ "$disconnect_reconnect_on" = "1" ];then
+		disconnect_reconnect_time=$(config_t_get global disconnect_reconnect_time)
+		[ -n "$disconnect_reconnect_time" ] && {
+			echo "*/$disconnect_reconnect_time * * * * $SS_PATH/reconnection.sh" >> /etc/crontabs/root
+			echo "$(date): 设置每$disconnect_reconnect_time分钟检测一次是否断线。" >> $LOG_FILE
+		}
+	fi
+	/etc/init.d/cron restart
+}
+
+start_dns() {
+	case "$DNS_MODE" in
+		ss-tunnel)
+			sstunnel_bin=$(find_bin ss-tunnel)
+			if [ -z "$sstunnel_bin" ]; then
+				echo "$(date): 找不到ss-tunnel主程序，无法启用！！！" >> $LOG_FILE
+			else
+				nohup $sstunnel_bin \
+				-c $CONFIG_FILE \
+				-u \
+				-l 7913 \
+				-L $DNS_FORWARD \
+				-f /var/run/ss-tunnel.pid \
+				>/dev/null 2>&1 &
+				echo "$(date): 运行DNS转发方案：ss-tunnel..." >> $LOG_FILE
+			fi
+		;;
+		ssr-tunnel)
+			ssrtunnel_bin=$(find_bin ssr-tunnel)
+			if [ -z "$ssrtunnel_bin" ]; then
+				echo "$(date): 找不到ssr-tunnel主程序，无法启用！！！" >> $LOG_FILE
+			else
+				nohup $ssrtunnel_bin \
+				-c $CONFIG_FILE \
+				-u \
+				-l 7913 \
+				-L $DNS_FORWARD \
+				-f /var/run/ssr-tunnel.pid \
+				>/dev/null 2>&1 &
+				echo "$(date): 运行DNS转发方案：ssr-tunnel..." >> $LOG_FILE
+			fi
+		;;
+		dns2socks)
+			dns2socks_bin=$(find_bin dns2socks)
+			sslocal_bin=$(find_bin "$ssbin"-local)
+			if [ -z "$dns2socks_bin" ] || [ -z "$sslocal_bin" ]; then
+				echo "$(date): 找不到dns2socks或$ssbin-local主程序，无法启用！！！" >> $LOG_FILE
+			else
+				nohup $sslocal_bin \
+				-c $CONFIG_FILE \
+				-l $SOCKS_PORT \
+				-f /var/run/$ssbin-local.pid \
+				>/dev/null 2>&1 &
+				echo "$(date): 运行DNS转发方案：$ssbin-local..." >> $LOG_FILE
+				nohup $dns2socks_bin \
+				127.0.0.1:$SOCKS_PORT \
+				$DNS_FORWARD \
+				127.0.0.1:7913 \
+				>/dev/null 2>&1 &
+				echo "$(date): 运行DNS转发方案：dns2socks..." >> $LOG_FILE
+			fi
+		;;
+		Pcap_DNSProxy)
+			pcapDnsproxy_bin=$(find_bin Pcap_DNSProxy)
+			if [ -z "$pcapDnsproxy_bin" ]; then
+				echo "$(date): 找不到Pcap_DNSProxy主程序，无法启用！！！" >> $LOG_FILE
+			else
+				nohup $pcapDnsproxy_bin -c /etc/pcap-dnsproxy >/dev/null 2>&1 &
+				echo "$(date): 运行DNS转发方案：Pcap_DNSProxy..." >> $LOG_FILE
+			fi
+		;;
+		pdnsd)
+			start_pdnsd		
+			echo "$(date): 运行DNS转发方案：Pdnsd..." >> $LOG_FILE
+		;;
+		dnsc)
+			start_dnsc		
+			echo "$(date): 运行DNS转发方案：dnsc..." >> $LOG_FILE
+		;;
+		dnsproxy)
+			dnsproxy_bin=$(find_bin dnsproxy)
+			if [ -z "$dnsproxy_bin" ]; then
+				echo "$(date): 找不到dnsproxy主程序，无法启用！！！" >> $LOG_FILE
+			else
+				if [ "$DNS_FORWARD_PORT" -eq 53 ]; then
+					nohup $dnsproxy_bin \
+					-d -T \
+					-p 7913 \
+					-R 208.67.222.222 \
+					-P 443 \
+					>/dev/null 2>&1 &
+				else
+					nohup $dnsproxy_bin \
+					-d \
+					-p 7913 \
+					-R $DNS_FORWARD_IP \
+					-P $DNS_FORWARD_PORT \
+					>/dev/null 2>&1 &
+				fi
+				echo "$(date): 运行DNS转发方案：dnsproxy..." >> $LOG_FILE
+			fi
+		;;
+		cdns)
+			cdns_bin=$(find_bin cdns)
+			if [ -z "$cdns_bin" ]; then
+				echo "$(date): 找不到cdns主程序，无法启用！！！" >> $LOG_FILE
+			else
+				nohup $cdns_bin -c /etc/cdns.json >/dev/null 2>&1 &
+				echo "$(date): 运行DNS转发方案：cdns..." >> $LOG_FILE
+			fi
+		;;
+		chinadns)
+			chinadns_bin=$(find_bin chinadns)
+			if [ -z "$chinadns_bin" ]; then
+				echo "$(date): 找不到ChinaDNS主程序，无法启用！！！" >> $LOG_FILE
+			else
+				other=1
+				echo "$(date): 运行DNS转发方案：ChinaDNS..." >> $LOG_FILE
+				case "$UP_DNS_MODE" in
+					OpenDNS)
+					#-c /etc/chinadns_chnroute.txt
+						other=0
+						nohup $chinadns_bin \
+						-p 7913 \
+						-c $SS_PATH_RULE/chnroute \
+						-m -d \
+						-s $DNS1,208.67.222.222:443 \
+						>/dev/null 2>&1 &
+						echo "$(date): 运行ChinaDNS上游转发方案：OpenDNS..." >> $LOG_FILE
+					;;
+					dnsproxy)
+						dnsproxy_bin=$(find_bin dnsproxy)
+						if [ -z "$dnsproxy_bin" ]; then
+							echo "$(date): 找不到dnsproxy主程序，无法启用！！！" >> $LOG_FILE
+						else
+							nohup $dnsproxy_bin \
+							-d -T \
+							-p 7913 \
+							-R 208.67.222.222 \
+							-P 443 \
+							>/dev/null 2>&1 &
+							echo "$(date): 运行ChinaDNS上游转发方案：dnsproxy..." >> $LOG_FILE
+						fi
+					;;
+					dns-forwarder)
+						dnsforwarder_bin=$(find_bin dns-forwarder)
+						if [ -z "$dnsforwarder_bin" ]; then
+							echo "$(date): 找不到dns-forwarder主程序，无法启用！！！" >> $LOG_FILE
+						else
+							nohup $dnsforwarder_bin \
+							-p 7913 \
+							-s $DNS_FORWARD \
+							>/dev/null 2>&1 &
+							echo "$(date): 运行ChinaDNS上游转发方案：dns-forwarder..." >> $LOG_FILE
+						fi
+					;;
+					ss-tunnel)
+						sstunnel_bin=$(find_bin ss-tunnel)
+						if [ -z "$sstunnel_bin" ]; then
+							echo "$(date): 找不到ss-tunnel主程序，无法启用！！！" >> $LOG_FILE
+						else
+							nohup $sstunnel_bin \
+							-c $CONFIG_FILE \
+							-u \
+							-l 7913 \
+							-L $DNS_FORWARD \
+							-f /var/run/ss-tunnel.pid \
+							>/dev/null 2>&1 &
+							echo "$(date): 运行ChinaDNS上游转发方案：ss-tunnel..." >> $LOG_FILE
+						fi
+					;;
+					ssr-tunnel)
+						ssrtunnel_bin=$(find_bin ssr-tunnel)
+						if [ -z "$ssrtunnel_bin" ]; then
+							echo "$(date): 找不到ssr-tunnel主程序，无法启用！！！" >> $LOG_FILE
+						else
+							nohup $ssrtunnel_bin \
+							-c $CONFIG_FILE \
+							-u \
+							-l 7913 \
+							-L $DNS_FORWARD \
+							-f /var/run/ssr-tunnel.pid \
+							>/dev/null 2>&1 &
+							echo "$(date): 运行ChinaDNS上游转发方案：ssr-tunnel..." >> $LOG_FILE
+						fi
+					;;
+				esac
+				if [ "$other" = "1" ];then
+					nohup $chinadns_bin \
+					-p 7923 \
+					-c $SS_PATH_RULE/chnroute \
+					-m -d \
+					-s $DNS1,127.0.0.1:7913 \
+					>/dev/null 2>&1 &
+				fi
+			fi
+		;;
+	esac
+}
+
+add_dnsmasq() {
+	mkdir -p $TMP_DNSMASQ_PATH
+	mkdir -p $DNSMASQ_PATH
+	local dns1 dns2 wirteconf dnsconf dnsport iface ISP_DNS isp_ip
+	dns1=$(config_t_get global dns_1)
+	dns2=$(config_t_get global dns_2)
+	dnsport=$(config_t_get global dns_port)
+	[ -z "$dnsport" ] && dnsport=0
+	if [ "$dns1" = "dnsbyisp" -o "$dns2" = "dnsbyisp" ]; then
+		cat > /etc/dnsmasq.conf <<EOF
+all-servers
+no-poll
+no-resolv
+cache-size=2048
+local-ttl=60
+neg-ttl=3600
+max-cache-ttl=1200
+EOF
+		echo "$(date): 生成Dnsmasq配置文件。" >> $LOG_FILE
+		
+		if [ "$dnsport" != "0" ]; then
+			ISP_DNS=`cat /tmp/resolv.conf.auto 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" |sort -u |grep -v 0.0.0.0 |grep -v 127.0.0.1`
+			failcount=0
+			while [ "$failcount" -lt "10" ]
+			do
+				interface=`ifconfig | grep "$dnsport" | awk '{print $1}'`
+				if [ -z "$interface" ];then
+					echo "$(date): 找不到出口接口：$dnsport，1分钟后再重试" >> $LOG_FILE
+					let "failcount++"
+					[ "$failcount" -ge 10 ] && exit 0
+					sleep 1m
+				else
+					echo "$(date): 已找到出口接口：$dnsport" >> $LOG_FILE
+					[ -n "$ISP_DNS" ] && {
+						for isp_ip in $ISP_DNS
+						do
+							echo server=$isp_ip >> /etc/dnsmasq.conf
+							route add -net ${isp_ip} netmask 255.255.255.255 ${dnsport}
+							echo "$(date): 添加运营商DNS出口路由表：$dnsport" >> $LOG_FILE
+						done
+					}
+					[ "$dns1" != "dnsbyisp" ] && {
+						route add -net ${dns1} netmask 255.255.255.255 ${dnsport}
+						echo "$(date): 添加DNS1出口路由表：$dnsport" >> $LOG_FILE
+						echo server=$dns1 >> /etc/dnsmasq.conf
+					}
+					[ "$dns2" != "dnsbyisp" ] && {
+						route add -net ${dns2} netmask 255.255.255.255 ${dnsport}
+						echo "$(date): 添加DNS2出口路由表：$dnsport" >> $LOG_FILE
+						echo server=$dns2 >> /etc/dnsmasq.conf
+					}
+					break
+				fi
+			done
+		else
+			ISP_DNS=`cat /tmp/resolv.conf.auto 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" |sort -u |grep -v 0.0.0.0 |grep -v 127.0.0.1`
+			[ -n "$ISP_DNS" ] && {
+				for isp_ip in $ISP_DNS
+				do
+					echo server=$isp_ip >> /etc/dnsmasq.conf
+				done
+			}
+			[ "$dns1" != "dnsbyisp" ] && {
+				echo server=$dns1 >> /etc/dnsmasq.conf
+			}
+			[ "$dns2" != "dnsbyisp" ] && {
+				echo server=$dns2 >> /etc/dnsmasq.conf
+			}
+		fi
+		
+#		if [ "$dnsport" -gt 0 ]; then
+#			temp_iface=`ip route|grep default|sed -n "$dnsport"p|awk {'print $5'}`
+#			iface=`cat /var/state/network 2>/dev/null|grep -w "$temp_iface" |awk -F'.' '{print $2}'`
+#			[ -z "$iface" ] && iface=`echo $temp_iface | awk -F'-' '{print $2}' 2>/dev/null`
+#			ISP_DNS=`cat /tmp/resolv.conf.auto 2>/dev/null| sed -n "/$iface/,+2p"| grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" |sort -u |grep -v 0.0.0.0 |grep -v 127.0.0.1`
+#			[ -n "$ISP_DNS" ] && {
+#				for isp_ip in $ISP_DNS
+#				do
+#					echo server=$isp_ip >> /etc/dnsmasq.conf
+#					/usr/sbin/addroute "$dnsport" "$isp_ip" "$Route_FILE" >> $LOG_FILE
+#				done
+#			}
+#			[ "$dns1" != "dnsbyisp" ] && {
+#				/usr/sbin/addroute "$dnsport" "$dns1" "$Route_FILE" >> $LOG_FILE
+#				echo server=$dns1 >> /etc/dnsmasq.conf
+#			}
+#			[ "$dns2" != "dnsbyisp" ] && {
+#				/usr/sbin/addroute "$dnsport" "$dns2" "$Route_FILE" >> $LOG_FILE
+#				echo server=$dns2 >> /etc/dnsmasq.conf
+#			}
+#	
+#		else
+#			ISP_DNS=`cat /tmp/resolv.conf.auto 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" |sort -u |grep -v 0.0.0.0 |grep -v 127.0.0.1`
+#			[ -n "$ISP_DNS" ] && {
+#				for isp_ip in $ISP_DNS
+#				do
+#					echo server=$isp_ip >> /etc/dnsmasq.conf
+#				done
+#			}
+#			[ "$dns1" != "dnsbyisp" ] && {
+#				/usr/sbin/addroute "$dnsport" "$dns1" "$Route_FILE" >> $LOG_FILE
+#				echo server=$dns1 >> /etc/dnsmasq.conf
+#			}
+#			[ "$dns2" != "dnsbyisp" ] && {
+#				/usr/sbin/addroute "$dnsport" "$dns2" "$Route_FILE" >> $LOG_FILE
+#				echo server=$dns2 >> /etc/dnsmasq.conf
+#			}
+#		fi
+	else
+		wirteconf=$(cat /etc/dnsmasq.conf 2>/dev/null | grep "server=$dns1")
+		dnsconf=$(cat /etc/dnsmasq.conf 2>/dev/null | grep "server=$dns2")
+		if [ "$dnsport" != "0" ]; then
+			failcount=0
+			while [ "$failcount" -lt "10" ]
+			do
+				interface=`ifconfig | grep "$dnsport" | awk '{print $1}'`
+				if [ -z "$interface" ];then
+					echo "$(date): 找不到出口接口：$dnsport，1分钟后再重试" >> $LOG_FILE
+					let "failcount++"
+					[ "$failcount" -ge 10 ] && exit 0
+					sleep 1m
+				else
+					echo "$(date): 已找到出口接口：$dnsport" >> $LOG_FILE
+					route add -net ${dns1} netmask 255.255.255.255 ${dnsport}
+					echo "$(date): 添加DNS1出口路由表：$dnsport" >> $LOG_FILE
+					route add -net ${dns2} netmask 255.255.255.255 ${dnsport}
+					echo "$(date): 添加DNS2出口路由表：$dnsport" >> $LOG_FILE
+					break
+				fi
+			done
+		fi
+		#[ "$dnsport" -gt 0 ] && /usr/sbin/addroute "$dnsport" "$dns1" "$Route_FILE" >> $LOG_FILE && /usr/sbin/addroute "$dnsport" "$dns2" "$Route_FILE" >> $LOG_FILE
+		if [ -z "$wirteconf" ] || [ -z "$dnsconf" ];then
+			cat > /etc/dnsmasq.conf <<EOF
+all-servers
+no-poll
+no-resolv
+server=$dns1
+server=$dns2
+cache-size=2048
+local-ttl=60
+neg-ttl=3600
+max-cache-ttl=1200
+EOF
+			echo "$(date): 生成Dnsmasq配置文件。" >> $LOG_FILE
+		fi
+	fi
+# if [ -n "cat /var/state/network |grep pppoe|awk -F '.' '{print $2}'" ]; then
+	# sed -i '/except-interface/d' /etc/dnsmasq.conf >/dev/null 2>&1 &
+	# for wanname in $(cat /var/state/network |grep pppoe|awk -F '.' '{print $2}')
+	# do
+		# echo "except-interface=$(uci get network.$wanname.ifname)" >>/etc/dnsmasq.conf
+	# done
+# fi
+
+if [ ! -f "$TMP_DNSMASQ_PATH/output.conf" ];then
+	ln -s $SS_PATH_DNSMASQ/output.conf $TMP_DNSMASQ_PATH/output.conf
+	restdns=1
+fi
+
+subscribe_by_ss=$(config_t_get global subscribe_by_ss)
+[ -z "$subscribe_by_ss" ] && subscribe_by_ss=0
+[ "$subscribe_by_ss" -eq 1 ] && {
+	baseurl=$(config_t_get global baseurl)
+	[ -n "$baseurl" ] && {
+		for url in $baseurl
+		do
+			if [ -n "`echo -n "$url" |grep "//"`" ]; then
+				echo -n "$url" | awk -F'/' '{print $3}' | sed "s/^/server=&\/./g" | sed "s/$/\/127.0.0.1#7913/g" >> $TMP_DNSMASQ_PATH/subscribe.conf
+				echo -n "$url" | awk -F'/' '{print $3}' | sed "s/^/ipset=&\/./g" | sed "s/$/\/ssoutput/g" >> $TMP_DNSMASQ_PATH/subscribe.conf
+			else
+				echo -n "$url" | awk -F'/' '{print $1}' | sed "s/^/server=&\/./g" | sed "s/$/\/127.0.0.1#7913/g" >> $TMP_DNSMASQ_PATH/subscribe.conf
+				echo -n "$url" | awk -F'/' '{print $1}' | sed "s/^/ipset=&\/./g" | sed "s/$/\/ssoutput/g" >> $TMP_DNSMASQ_PATH/subscribe.conf
+			fi
+		done
+		restdns=1
+	}
+}
+
+if [ ! -f "$TMP_DNSMASQ_PATH/gfwlist.conf" ];then
+	ln -s $SS_PATH_DNSMASQ/gfwlist.conf $TMP_DNSMASQ_PATH/gfwlist.conf
+	restdns=1
+fi
+if [ ! -f "$TMP_DNSMASQ_PATH/custom.conf" ];then
+	cat $SS_PATH_RULE/gfwlist | awk '{print "server=/"$1"/127.0.0.1#7913\nipset=/"$1"/gfwlist"}' >> $TMP_DNSMASQ_PATH/custom.conf
+	restdns=1
+fi
+if [ ! -f "$TMP_DNSMASQ_PATH/sscdn.conf" ];then
+	cat $SS_PATH_DNSMASQ/cdn.conf | sed "s/^/ipset=&\/./g" | sed "s/$/\/&cdn/g" | sort | awk '{if ($0!=line) print;line=$0}' >$TMP_DNSMASQ_PATH/sscdn.conf
+	restdns=1
+fi
+userconf=$(grep -c "" $SS_PATH_DNSMASQ/user.conf)
+if [ "$userconf" -gt 0  ];then
+	ln -s $SS_PATH_DNSMASQ/user.conf $TMP_DNSMASQ_PATH/user.conf
+	restdns=1
+fi
+backhome=$(config_t_get global proxy_mode gfwlist)
+if [ "$backhome" == "returnhome" ];then
+	rm -rf $TMP_DNSMASQ_PATH/gfwlist.conf
+	rm -rf $TMP_DNSMASQ_PATH/custom.conf
+	rm -rf $TMP_DNSMASQ_PATH/sscdn.conf
+	cat $SS_PATH_RULE/adblock | awk '{print "server=/"$1"/127.0.0.1#7913"}' >> $TMP_DNSMASQ_PATH/home.conf
+	restdns=1
+echo "$(date): 生成回国模式Dnsmasq配置文件。" >> $LOG_FILE
+fi
+cp -pR $TMP_DNSMASQ_PATH/* $DNSMASQ_PATH
+if [ "$restdns" == 1 ];then
+	echo "$(date): 重启Dnsmasq。。。" >> $LOG_FILE
+	/etc/init.d/dnsmasq restart  2>/dev/null
+fi
+}
+
+start_pdnsd() {
+pdnsd_bin=$(find_bin pdnsd)
+if [ -z "$pdnsd_bin" ]; then
+	echo "$(date): 找不到pdnsd主程序，无法启用！！！" >> $LOG_FILE
+else
+CACHEDIR=/var/pdnsd
+CACHE=$CACHEDIR/pdnsd.cache
+if ! test -f "$CACHE"; then
+	mkdir -p `dirname $CACHE`
+	touch $CACHE
+	chown -R root.nogroup $CACHEDIR
+fi
+
+	cat > $CACHEDIR/pdnsd.conf <<EOF
+global {
+  perm_cache=4096;
+  cache_dir="/var/pdnsd";
+  run_as="root";
+  server_ip = 127.0.0.1;
+  server_port=7913;
+  status_ctl = on;
+  query_method=tcp_only;
+  min_ttl=1d;
+  max_ttl=1w;
+  timeout=10;
+  tcp_qtimeout=1;
+  par_queries=2;
+  neg_domain_pol=on;
+  udpbufsize=1024;
+}
+server {
+  label = "opendns";
+  ip = 208.67.222.222, 208.67.220.220;
+  reject=4.36.66.178, 8.7.198.45, 37.61.54.158, 46.82.174.68, 59.24.3.173, 64.33.88.161, 64.33.99.47, 64.66.163.251, 65.104.202.252, 65.160.219.113, 66.45.252.237, 72.14.205.99, 72.14.205.104, 78.16.49.15, 93.46.8.89, 128.121.126.139, 159.106.121.75, 169.132.13.103, 192.67.198.6, 202.106.1.2, 202.181.7.85, 203.161.230.171, 207.12.88.98, 208.56.31.43, 209.36.73.33, 209.145.54.50, 209.220.30.174, 211.94.66.147, 213.169.251.35, 216.221.188.182, 216.234.179.13;
+  edns_query=on;
+  port = 5353;
+  timeout = 4;
+  interval=60;
+  query_test_name="a.com";
+  uptest = none;
+  purge_cache=off;
+  caching=on;
+}
+server {
+  label="Google";
+  ip=8.8.8.8,8.8.4.4;
+  reject=4.36.66.178, 8.7.198.45, 37.61.54.158, 46.82.174.68, 59.24.3.173, 64.33.88.161, 64.33.99.47, 64.66.163.251, 65.104.202.252, 65.160.219.113, 66.45.252.237, 72.14.205.99, 72.14.205.104, 78.16.49.15, 93.46.8.89, 128.121.126.139, 159.106.121.75, 169.132.13.103, 192.67.198.6, 202.106.1.2, 202.181.7.85, 203.161.230.171, 207.12.88.98, 208.56.31.43, 209.36.73.33, 209.145.54.50, 209.220.30.174, 211.94.66.147, 213.169.251.35, 216.221.188.182, 216.234.179.13;
+  edns_query=on;
+  timeout=3;
+  interval=60;
+  uptest=none;
+  query_test_name="a.com";
+  purge_cache=off;
+  caching=on;
+}
+source {
+  ttl=86400;
+  owner="localhost.";
+  serve_aliases=on;
+  file="/etc/hosts";
+}
+EOF
+
+  $pdnsd_bin --daemon -c $CACHEDIR/pdnsd.conf -p /var/run/pdnsd.pid -d
+fi
+}
+
+start_dnsc() {
+dnsc_bin=$(find_bin dnsc)
+if [ -z "$dnsc_bin" ]; then
+	echo "$(date): 找不到dnsc主程序，无法启用！！！" >> $LOG_FILE
+else
+#log level
+# 6-off, 5-all, 4-DEBUG, 3-INFO, 2-WARN, 1-ERROR
+cat > /etc/dnsc/dnsc.conf <<EOF
+listen_ip = 127.0.0.1
+listen_port = 7913
+servers = 208.67.222.222@443,208.67.220.220@5353,8.8.8.8
+blacklist= /etc/dnsc/iplist.txt
+daemon = 1
+logfile = /var/log/dnsc.log
+loglevel = 3
+EOF
+
+$dnsc_bin -c /etc/dnsc/dnsc.conf
+fi
+}
+
+stop_dnsmasq() {
+if [ "$GLOBAL_SERVER" == "nil" ]; then
+	rm -rf $TMP_DNSMASQ_PATH/*
+	rm -rf $DNSMASQ_PATH/*
+	/etc/init.d/dnsmasq restart  2>/dev/null
+echo "$(date): Shadowsocks未开启!" >> $LOG_FILE
+fi
+}
+
+gen_basecfg(){
+bport=$(config_t_get global haproxy_port)
+cat <<-EOF >$lb_FILE
+global
+    log         127.0.0.1 local2
+    chroot      /usr/bin
+    pidfile     /var/run/haproxy.pid
+    maxconn     60000
+    stats socket  /var/run/haproxy.sock
+    user        root
+    daemon
+defaults
+    mode                    tcp
+    log                     global
+    option                  tcplog
+    option                  dontlognull
+    option http-server-close
+    #option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 2
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 3000
+listen shadowsocks
+    bind 0.0.0.0:$bport
+    mode tcp
+EOF
+}
+gen_lbsscfg(){
+echo "$(date): 负载均衡服务启动中..." >> $LOG_FILE
+	for i in $(seq 0 100)
+	do
+		bips=$(config_t_get balancing lbss '' $i)
+		bports=$(config_t_get balancing lbort '' $i)
+		bweight=$(config_t_get balancing lbweight '' $i)
+		exports=$(config_t_get balancing export '' $i)
+		bbackup=$(config_t_get balancing backup '' $i)
+		if [ -z "$bips" ] || [ -z "$bports" ] ; then
+			break
+		fi
+		if [ "$bbackup" = "1" ] ; then
+			bbackup=" backup"
+			echo "$(date): 添加故障转移备服务器$bips" >> $LOG_FILE
+		else
+			bbackup=""
+			echo "$(date): 添加负载均衡主服务器$bips" >> $LOG_FILE
+		fi
+		
+		si=`echo $bips|grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}"`
+		if [ -z "$si" ];then      
+			echo "$(date): 检测到你的服务器为域名:$bips ，尝试解析...">> $LOG_FILE
+			bips=`resolveip -4 -t 2 $bips|awk 'NR==1{print}'`
+			if [ -z "$bips" ];then
+				echo "$(date): 解析失败，更换方案再次尝试！">> $LOG_FILE
+				bips=`nslookup $bips localhost | sed '1,4d' | awk '{print $3}' | grep -v :|awk 'NR==1{print}'`
+			fi
+			echo "$(date): 解析到服务器IP为：$bips">> $LOG_FILE
+		fi
+		echo "    server ss$i $bips:$bports weight $bweight check inter 1500 rise 1 fall 3 $bbackup" >> $lb_FILE
+		
+		failcount=0
+		while [ "$failcount" -lt "10" ]
+		do
+			interface=`ifconfig | grep "$exports" | awk '{print $1}'`
+			if [ -z "$interface" ];then
+				echo "$(date): 找不到出口接口：$exports，1分钟后再重试" >> $LOG_FILE
+				let "failcount++"
+				[ "$failcount" -ge 10 ] && exit 0
+				sleep 1m
+			else
+				echo "$(date): 已找到出口接口：$exports" >> $LOG_FILE
+				route add -net ${bips} netmask 255.255.255.255 ${exports}
+				echo "$(date): 添加SS出口路由表：$exports" >> $LOG_FILE
+				echo "$bips" >> /tmp/balancing_ip
+				break
+			fi
+		done
+	done
+}
+gen_lbadmincfg(){
+adminstatus=$(config_t_get global admin_enable)
+if [ "$adminstatus" = "1" ];then
+adminport=$(config_t_get global admin_port)
+adminuser=$(config_t_get global admin_user)
+adminpassword=$(config_t_get global admin_password)
+cat <<-EOF >>$lb_FILE
+listen status
+    bind 0.0.0.0:$adminport
+    mode http                   
+    stats refresh 30s
+    stats uri  /  
+    stats auth $adminuser:$adminpassword
+    #stats hide-version
+    stats admin if TRUE
+EOF
+fi
+}
+
+remove_fwmark_rule(){
+	ip_rule_exist=`/sbin/ip rule show | grep "from all fwmark 0x7 lookup 310" | grep -c 310`
+	if [ ! -z "$ip_rule_exist" ];then
+		until [ "$ip_rule_exist" = 0 ]
+		do 
+			/sbin/ip rule del fwmark 0x07 table 310
+			ip_rule_exist=`expr $ip_rule_exist - 1`
+		done
+	fi
+}
+
+start_sslb(){
+lbenabled=$(config_t_get global balancing_enable 0)
+if [ "$lbenabled" = "1" ];then
+    haproxy_bin=$(find_bin haproxy)
+	if [ -z "$haproxy_bin" ]; then
+		 echo "$(date): 找不到haproxy主程序，无法启用！！！" >> $LOG_FILE
+	else
+		gen_basecfg
+		gen_lbsscfg
+		gen_lbadmincfg
+		$haproxy_bin -f $lb_FILE
+		echo "$(date): 负载均衡服务运行成功！" >> $LOG_FILE
+	fi
+else
+    echo "$(date): 负载均衡服务未启用！" >> $LOG_FILE    
+fi
+}
+
+get_action_chain() {
+	case "$1" in
+		disable)
+			echo "RETURN"
+		;;
+		global)
+			echo "SS_GLO"
+		;;
+		gfwlist)
+			echo "SS_GFW"
+		;;
+		chnroute)
+			echo "SS_CHN"
+		;;
+		gamemode)
+			echo "SS_GAM"
+		;;
+		returnhome)
+			echo "SS_HOME"
+		;;
+	esac
+}
+
+get_ip_mark(){
+	if [ -z "$1" ]; then
+		echo ""
+	else
+		echo $1 | awk -F "." '{printf ("0x%02X", $1)} {printf ("%02X", $2)} {printf ("%02X", $3)} {printf ("%02X", $4)}'
+	fi
+}			  
+
+add_vps_port() {
+multiwan=$(config_t_get global wan_port 0)
+lbenabled=$(config_t_get global balancing_enable 0)
+if [ "$lbenabled" == "0" ] && [ "$multiwan" != "0" ]; then
+	failcount=0
+	while [ "$failcount" -lt "10" ]
+	do
+		interface=`ifconfig | grep "$multiwan" | awk '{print $1}'`
+		if [ -z "$interface" ];then
+			echo "$(date): 找不到出口接口：$multiwan，1分钟后再重试" >> $LOG_FILE
+			let "failcount++"
+			[ "$failcount" -ge 10 ] && exit 0
+			sleep 1m
+		else
+			echo "$(date): 已找到出口接口：$multiwan" >> $LOG_FILE
+			route add -net ${vpsip} netmask 255.255.255.255 ${multiwan}
+			echo "$(date): 添加SS出口路由表：$multiwan" >> $LOG_FILE
+			echo "$vpsip" > /tmp/ss_ip
+			break
+		fi
+	done
+fi
+#[ "$lbenabled" = 0 ] && /usr/sbin/addroute "$multiwan" "$vpsip" "$Route_FILE" >> $LOG_FILE
+}
+
+del_vps_port() {
+ssip=$(cat /tmp/ss_ip 2> /dev/null)
+if [ ! -z "$ssip" ]; then
+	route del -net ${ssip} netmask 255.255.255.255
+	echo "$(date): 删除SS出口路由表：$multiwan" >> $LOG_FILE
+	rm /tmp/ss_ip
+fi
+#        if [ -f "$Route_FILE" ]; then
+#                source $Route_FILE >/dev/null 2>&1 && rm -f $Route_FILE >/dev/null 2>&1
+#        else
+#                for ip in $(ip route show|grep -v static | grep via |awk -F' ' '{print $1}'|grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}")
+#                do
+#                        for route in "$(ip route show|grep via|grep -w $ip)"
+#                        do
+#                                ip route del $route 2>/dev/null
+#                                echo "$(date): 删除已设置的指定IP路由：$route" >> $LOG_FILE
+#                        done
+#                done
+#        fi
+}
+
+dns_hijack(){
+dnshijack=$(config_t_get global dns_53)
+if [ "$dnshijack" = "1" ];then
+	chromecast_nu=`iptables -t nat -L PREROUTING -v -n --line-numbers|grep "dpt:53"|awk '{print $1}'`
+	is_right_lanip=`iptables -t nat -L PREROUTING -v -n --line-numbers|grep "dpt:53" |grep "$lanip"`
+	if [ -z "$chromecast_nu" ]; then
+		echo "$(date): 添加接管局域网DNS解析规则..." >> $LOG_FILE
+		iptables -t nat -A PREROUTING -i br-lan -p udp --dport 53 -j DNAT --to $lanip 2>/dev/null
+	else
+		if [ -z "$is_right_lanip" ]; then
+			echo "$(date): 添加接管局域网DNS解析规则..." >> $LOG_FILE
+			iptables -t nat -D PREROUTING $chromecast_nu >/dev/null 2>&1
+			iptables -t nat -A PREROUTING -i br-lan -p udp --dport 53 -j DNAT --to $lanip 2>/dev/null
+		else
+			echo "$(date):  DNS劫持规则已经添加，跳过~" >>$LOG_FILE
+		fi
+	fi
+fi
+}
+
+load_acl(){
+	local ipaddr
+	local macaddr
+	local proxy_mode
+	local ports
+	config_get ipaddr $1 ipaddr
+	config_get macaddr $1 macaddr
+	config_get acl_mode $1 proxy_mode
+	config_get ports $1 ports
+	local ip_mark=`get_ip_mark $ipaddr`								 
+	[ -n "$acl_mode" ] && {
+		if [ -n "$ipaddr" ] || [ -n "$macaddr" ]; then
+			if [ -n "$ports" ]; then
+				if [ -n "$ipaddr" -a -n "$macaddr" ]; then
+					echo "$(date): 加载ACL规则：IP为$ipaddr，MAC为$macaddr，端口为$ports，模式为：$acl_mode" >> $LOG_FILE
+				else
+					[ -n "$ipaddr" ] && echo "$(date): 加载ACL规则：IP为$ipaddr，端口为$ports，模式为：$acl_mode" >> $LOG_FILE
+					[ -n "$macaddr" ] && echo "$(date): 加载ACL规则：MAC为$macaddr，端口为$ports，模式为：$acl_mode" >> $LOG_FILE
+				fi
+			else
+				if [ -n "$ipaddr" -a -n "$macaddr" ]; then
+					echo "$(date): 加载ACL规则：IP为$ipaddr，MAC为$macaddr，模式为：$acl_mode" >> $LOG_FILE
+				else
+					[ -n "$ipaddr" ] && echo "$(date): 加载ACL规则：IP为$ipaddr，模式为：$acl_mode" >> $LOG_FILE
+					[ -n "$macaddr" ] && echo "$(date): 加载ACL规则：MAC为$macaddr，模式为：$acl_mode" >> $LOG_FILE
+				fi
+				
+			fi
+			iptables -t nat -A SS $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") $(factor $ports "-m multiport --dport") -$(get_jump_mode $acl_mode) $(get_action_chain $acl_mode)
+			#iptables -t nat -A SS $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -$(get_jump_mode $acl_mode) $(get_action_chain $acl_mode)
+			#iptables -t nat -A SS $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -$(get_jump_mode $acl_mode) $(get_action_chain $acl_mode)
+			if [ "$acl_mode" == "gamemode" ]; then
+				[ "$PROXY_MODE" != "gamemode" ] && iptables -t mangle -A SS $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -$(get_jump_mode $acl_mode) $(get_action_chain $acl_mode)
+			else
+				[ "$PROXY_MODE" == "gamemode" ] && iptables -t mangle -A SS $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN
+			fi
+			[ -z "$ipaddr" ] && {
+				lower_macaddr=`echo $macaddr | tr '[A-Z]' '[a-z]'`
+				ipaddr=`ip neigh show | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | grep $lower_macaddr | awk '{print $1}'`
+				[ -z "$ipaddr" ] && {
+					dhcp_index=`uci show dhcp | grep $lower_macaddr |awk -F'.' '{print $2}'`
+					ipaddr=`uci -q get dhcp.$dhcp_index.ip`
+				}
+				[ -z "$ipaddr" ] && ipaddr=`cat /tmp/dhcp.leases | grep -E "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" |grep $lower_macaddr |awk '{print $3}'`
+			}
+			[ -n "$ipaddr" ] && {
+				ip_mark=`get_ip_mark $ipaddr`
+				iptables -t nat -A SS_EXT -p tcp $(factor $ports "-m multiport --dport") $(factor $ip_mark "-m mark --mark") -$(get_jump_mode $acl_mode) $(get_action_chain $acl_mode)
+				if [ "$USEKCP" != "1" ]; then
+					iptables -t nat -A SS_EXT -p udp $(factor $ports "-m multiport --dport") $(factor $ip_mark "-m mark --mark") -$(get_jump_mode $acl_mode) $(get_action_chain $acl_mode)
+				fi
+			}
+		fi
+	}
+}
+
+add_rule() {
+  echo "$(date): 开始加载防火墙规则..." >> $LOG_FILE
+	#创建所需的ipset
+	IPSET_GFW="gfwlist"
+	IPSET_CHN="chnroute"
+	IPSET_CDN="cdn"
+	IPSET_ROUTE="ssoutput"			
+	IPSET_HOME="cnhome"
+	ipset -! create $IPSET_GFW nethash && ipset flush $IPSET_GFW
+	ipset -! create $IPSET_CDN nethash && ipset flush $IPSET_CDN
+	ipset -! create $IPSET_ROUTE nethash && ipset flush $IPSET_ROUTE
+	ipset -! create $IPSET_CHN nethash && ipset flush $IPSET_CHN
+	sed -e "s/^/add $IPSET_CHN &/g" $SS_PATH_RULE/chnroute | awk '{print $0} END{print "COMMIT"}' | ipset -R
+	sed -e "s/^/add $IPSET_GFW &/g" $SS_PATH_RULE/custom | awk '{print $0} END{print "COMMIT"}' | ipset -R
+	sed -e "s/^/add $IPSET_CDN &/g" $SS_PATH_RULE/whiteip | awk '{print $0} END{print "COMMIT"}' | ipset -R
+
+	
+	ISP_DNS=`cat /tmp/resolv.conf.auto 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | sort -u |grep -v 0.0.0.0 |grep -v 127.0.0.1`
+	[ -n "$ISP_DNS" ] && {
+		for ispip in $ISP_DNS
+		do
+			ipset -! add $IPSET_CDN $ispip >/dev/null 2>&1
+		done
+	}
+
+	#生成代理规则
+	iptables -t nat -N SS
+	ip6tables -t nat -N SS
+	
+	#获取prerouting_rule规则行号
+	KP_INDEX=`iptables -t nat -L PREROUTING|tail -n +3|sed -n -e '/^KOOLPROXY/='`
+	if [ -n "$KP_INDEX" ]; then
+		let KP_INDEX+=1
+		#确保添加到KOOLPROXY规则之后
+		iptables -t nat -I PREROUTING $KP_INDEX -j SS
+	else
+		PR_INDEX=`iptables -t nat -L PREROUTING|tail -n +3|sed -n -e '/^prerouting_rule/='`
+		#如果kp没有运行，确保添加到prerouting_rule规则之后
+		if [ -z "$PR_INDEX" ]; then
+			PR_INDEX=1
+		else
+			let PR_INDEX+=1
+		fi
+		iptables -t nat -I PREROUTING $PR_INDEX -j SS
+	fi
+												   
+	#  忽略特殊IP段
+	lan_ipv4=`ip address show br-lan | grep -w "inet" |awk '{print $2}'`  #当前LAN IPv4段
+	lan_ipv6=`ip address show br-lan | grep -w "inet6" |awk '{print $2}'`  #当前LAN IPv6段
+	iptables -t nat -A SS -d 0.0.0.0/8 -j RETURN
+	iptables -t nat -A SS -d 10.0.0.0/8 -j RETURN
+	iptables -t nat -A SS -d 100.64.0.0/10 -j RETURN
+	iptables -t nat -A SS -d 127.0.0.0/8 -j RETURN
+	iptables -t nat -A SS -d 169.254.0.0/16 -j RETURN
+	iptables -t nat -A SS -d 172.16.0.0/12 -j RETURN
+	iptables -t nat -A SS -d 192.168.0.0/16 -j RETURN
+	iptables -t nat -A SS -d 224.0.0.0/4 -j RETURN
+	iptables -t nat -A SS -d 240.0.0.0/4 -j RETURN
+	[ -n "$lan_ipv4" ] && iptables -t nat -A SS -d $lan_ipv4 -j RETURN
+	[ -n "$lan_ipv6" ] && {
+		for ip in $lan_ipv6
+		do
+			ip6tables -t nat -A SS -d $ip -j RETURN
+		done
+	}
+	if [ "$use_ipv6" != "1" ];then
+		[ -n "$vpsip" ] && iptables -t nat -A SS -d $vpsip -j RETURN
+	else
+		[ -n "$vpsip" ] && ip6tables -t nat -A SS -d $vpsip -j RETURN
+	fi
+	iptables -t nat -A SS -m set --match-set $IPSET_CDN dst -j RETURN
+	#  生成对应CHAIN
+	iptables -t nat -N SS_GLO
+	iptables -t nat -A SS_GLO -p tcp -j REDIRECT --to $LOCAL_PORT
+	ip6tables -t nat -N SS_GLO
+	ip6tables -t nat -A SS_GLO -p tcp -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -N SS_GFW
+	iptables -t nat -A SS_GFW -p tcp -m set --match-set $IPSET_GFW dst -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -A SS_GFW -p tcp -m set --match-set $IPSET_ROUTE dst -j REDIRECT --to $LOCAL_PORT
+	ip6tables -t nat -N SS_GFW
+	iptables -t nat -N SS_CHN
+	ip6tables -t nat -N SS_CHN
+	#if [ "$PROXY_MODE" == "chnroute" ]; then
+	iptables -t nat -A SS_CHN -m set --match-set $IPSET_CHN dst -j RETURN
+	#fi
+	#iptables -t nat -A SS_CHN -p tcp -m set --match-set $IPSET_GFW dst -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -A SS_CHN -p tcp -j REDIRECT --to $LOCAL_PORT
+	#iptables -t nat -A SS_CHN -p tcp -m geoip ! --destination-country CN -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -N SS_HOME
+	ip6tables -t nat -N SS_HOME
+	#iptables -t nat -A SS_HOME -p tcp -m geoip --destination-country CN -j REDIRECT --to $LOCAL_PORT
+	#  游戏模式
+	iptables -t nat -N SS_GAM
+	ip6tables -t nat -N SS_GAM
+	#iptables -t nat -A SS_GAM -p tcp -m geoip ! --destination-country CN -j REDIRECT --to $LOCAL_PORT
+	/sbin/ip route add local 0.0.0.0/0 dev lo table 310
+	/sbin/ip rule add fwmark 0x07 table 310 pref 789
+	iptables -t mangle -N SS 2>/dev/null
+	ip6tables -t mangle -N SS 2>/dev/null
+	iptables -t mangle -I PREROUTING 1 -p udp -j SS
+	ip6tables -t mangle -I PREROUTING 1 -p udp -j SS
+	iptables -t mangle -A SS -p udp -d 0.0.0.0/8 -j RETURN
+	iptables -t mangle -A SS -p udp -d 10.0.0.0/8 -j RETURN
+	iptables -t mangle -A SS -p udp -d 100.64.0.0/10 -j RETURN
+	iptables -t mangle -A SS -p udp -d 127.0.0.0/8 -j RETURN
+	iptables -t mangle -A SS -p udp -d 169.254.0.0/16 -j RETURN
+	iptables -t mangle -A SS -p udp -d 172.16.0.0/12 -j RETURN
+	iptables -t mangle -A SS -p udp -d 192.168.0.0/16 -j RETURN
+	iptables -t mangle -A SS -p udp -d 224.0.0.0/4 -j RETURN
+	iptables -t mangle -A SS -p udp -d 240.0.0.0/4 -j RETURN
+	[ -n "$lan_ipv4" ] && iptables -t mangle -A SS -p udp -d $lan_ipv4 -j RETURN
+	[ -n "$lan_ipv6" ] && {
+		for ip in $lan_ipv6
+		do
+			ip6tables -t mangle -A SS -p udp -d $ip -j RETURN
+		done
+	}
+	if [ "$use_ipv6" != "1" ];then
+		[ -n "$vpsip" ] && iptables -t mangle -A SS -p udp -d $vpsip -j RETURN
+	else
+		[ -n "$vpsip" ] && ip6tables -t mangle -A SS -p udp -d $vpsip -j RETURN
+	fi
+	iptables -t mangle -A SS -p udp -m set --match-set $IPSET_CDN dst -j RETURN
+	iptables -t mangle -N SS_GAM
+	iptables -t mangle -A SS_GAM -p udp -m set --match-set $IPSET_GFW dst -j TPROXY --on-port $LOCAL_PORT --tproxy-mark 0x07
+	#iptables -t mangle -A SS_GAM -p udp -m geoip ! --destination-country CN -j TPROXY --on-port $LOCAL_PORT --tproxy-mark 0x07
+	#  扩展模式
+	iptables -t nat -N SS_EXT 2>/dev/null
+	ip6tables -t nat -N SS_EXT 2>/dev/null
+	if [ "$use_ipv6" != "1" ];then
+		[ -n "$vpsip" ] && iptables -t nat -A SS_EXT -p tcp -d $vpsip -j RETURN
+	else
+		[ -n "$vpsip" ] && ip6tables -t nat -A SS_EXT -p tcp -d $vpsip -j RETURN
+	fi
+	iptables -t nat -A SS_EXT -m set --match-set $IPSET_CDN dst -j RETURN
+	#iptables -t nat -A SS_EXT -p tcp -m set --match-set $IPSET_CDN dst -j RETURN
+	#  用于状态检测
+	iptables -t nat -I OUTPUT -p tcp -m set --match-set $IPSET_ROUTE dst -j REDIRECT --to-ports $LOCAL_PORT
+	#  将KP的流量导入ss
+	iptables -t nat -A OUTPUT -m mark --mark $ip_prefix_hex -j SS_EXT
+	#  加载ACLS
+	config_foreach load_acl acl_rule
+	#  加载默认代理模式
+	iptables -t nat -A SS -j $(get_action_chain $PROXY_MODE)
+	iptables -t nat -A SS_EXT -j $(get_action_chain $PROXY_MODE)
+	[ "$PROXY_MODE" == "gamemode" ] && iptables -t mangle -A SS -p udp -j $(get_action_chain $PROXY_MODE)
+	if [ "$USEKCP" != "1" ]; then
+		iptables -t nat -A SS_GLO -p udp -j REDIRECT --to $LOCAL_PORT
+		iptables -t nat -A SS_GFW -p udp -m set --match-set $IPSET_GFW dst -j REDIRECT --to $LOCAL_PORT
+		iptables -t nat -A SS_GFW -p udp -m set --match-set $IPSET_ROUTE dst -j REDIRECT --to $LOCAL_PORT
+		iptables -t nat -A SS_CHN -p udp -j REDIRECT --to $LOCAL_PORT
+		if [ "$use_ipv6" != "1" ];then
+			iptables -t nat -A SS_EXT -p udp -d $vpsip -j RETURN
+		else
+			ip6tables -t nat -A SS_EXT -p udp -d $vpsip -j RETURN
+		fi
+		iptables -t nat -I OUTPUT -p udp -m set --match-set $IPSET_ROUTE dst -j REDIRECT --to-ports $LOCAL_PORT
+	fi
+	echo "$(date): IPv4防火墙规则加载完成！" >> $LOG_FILE
+	
+	if [ "$forwarding_ipv6" == "1" ];then
+		ip6tables -t nat -A PREROUTING -j SS
+		ip6tables -t nat -A SS -p tcp -j REDIRECT --to-ports $LOCAL_PORT
+		ip6tables -t nat -A SS -p udp -j REDIRECT --to-ports $LOCAL_PORT
+		ip6tables -t nat -A OUTPUT -p tcp -j SS
+		ip6tables -t nat -A OUTPUT -p udp -j SS
+	fi
+	
+	echo "$(date): IPv6防火墙规则加载完成！" >> $LOG_FILE
+
+}
+
+clean_firewall_rule() {
+	ipv4_nat_exist=`iptables -t nat -L PREROUTING | grep -c SS`
+	if [ ! -z "$ipv4_nat_exist" ];then
+		until [ "$ipv4_nat_exist" = 0 ]
+	do 
+		iptables -t nat -D PREROUTING -j SS 2>/dev/null
+		ipv4_nat_exist=`expr $ipv4_nat_exist - 1`
+	done
+	fi
+	ipv6_nat_exist=`ip6tables -t nat -L PREROUTING | grep -c SS`
+	if [ ! -z "$ipv6_nat_exist" ];then
+		until [ "$ipv6_nat_exist" = 0 ]
+	do 
+		ip6tables -t nat -D PREROUTING -j SS 2>/dev/null
+		ipv6_nat_exist=`expr $ipv6_nat_exist - 1`
+	done
+	fi
+	
+	ipv4_out_ext=`iptables -t nat -L OUTPUT -nv --line-numbers | grep "SS_EXT" |awk '{print $1}'`
+	[ -n "$ipv4_out_ext" ] && {
+		iptables -t nat -D OUTPUT $ipv4_out_ext 2>/dev/null
+		iptables -t nat -D OUTPUT -p tcp -m set --match-set ssoutput dst -j REDIRECT --to-ports 1080 2>/dev/null
+		iptables -t nat -D OUTPUT -p udp -m set --match-set ssoutput dst -j REDIRECT --to-ports 1080 2>/dev/null
+	}
+	
+	ip6tables -t nat -D OUTPUT -p tcp -j SS
+	ip6tables -t nat -D OUTPUT -p udp -j SS
+	
+	ipv4_chromecast_nu=`iptables -t nat -L PREROUTING -v -n --line-numbers|grep "dpt:53"|awk '{print $1}'`
+	if [ -n "$ipv4_chromecast_nu" ]; then
+		[ "`uci -q get koolproxy.@global[0].enabled`" -eq 0 ] || [ "`uci -q get koolproxy.@global[0].filter_mode`" != "adblock" ] && iptables -t nat -D PREROUTING $ipv4_chromecast_nu 2>/dev/null
+	fi
+	
+	ipv6_chromecast_nu=`ip6tables -t nat -L PREROUTING -v -n --line-numbers|grep "dpt:53"|awk '{print $1}'`
+	if [ -n "$ipv6_chromecast_nu" ]; then
+		[ "`uci -q get koolproxy.@global[0].enabled`" -eq 0 ] || [ "`uci -q get koolproxy.@global[0].filter_mode`" != "adblock" ] && ip6tables -t nat -D PREROUTING $ipv6_chromecast_nu 2>/dev/null
+	fi
+}
+
+del_firewall_rule() {
+  clean_firewall_rule
+  iptables -t nat -F SS 2>/dev/null && iptables -t nat -X SS 2>/dev/null
+  iptables -t nat -F SS_EXT 2>/dev/null && iptables -t nat -X SS_EXT 2>/dev/null
+  iptables -t nat -F SS_GLO 2>/dev/null && iptables -t nat -X SS_GLO 2>/dev/null
+  iptables -t nat -F SS_GFW 2>/dev/null && iptables -t nat -X SS_GFW 2>/dev/null
+  iptables -t nat -F SS_CHN 2>/dev/null && iptables -t nat -X SS_CHN 2>/dev/null
+  iptables -t nat -F SS_GAM 2>/dev/null && iptables -t nat -X SS_GAM 2>/dev/null
+  iptables -t nat -F SS_HOME 2>/dev/null && iptables -t nat -X SS_HOME 2>/dev/null
+  iptables -t mangle -F SS 2>/dev/null && iptables -t mangle -X SS 2>/dev/null
+  iptables -t mangle -F SS_GAM 2>/dev/null && iptables -t mangle -X SS_GAM 2>/dev/null
+  
+  ip6tables -t nat -F SS 2>/dev/null && ip6tables -t nat -X SS 2>/dev/null
+  ip6tables -t nat -F SS_EXT 2>/dev/null && ip6tables -t nat -X SS_EXT 2>/dev/null
+  ip6tables -t nat -F SS_GLO 2>/dev/null && ip6tables -t nat -X SS_GLO 2>/dev/null
+  ip6tables -t nat -F SS_GFW 2>/dev/null && ip6tables -t nat -X SS_GFW 2>/dev/null
+  ip6tables -t nat -F SS_CHN 2>/dev/null && ip6tables -t nat -X SS_CHN 2>/dev/null
+  ip6tables -t nat -F SS_GAM 2>/dev/null && ip6tables -t nat -X SS_GAM 2>/dev/null
+  ip6tables -t nat -F SS_HOME 2>/dev/null && ip6tables -t nat -X SS_HOME 2>/dev/null
+  ip6tables -t mangle -F SS 2>/dev/null && ip6tables -t mangle -X SS 2>/dev/null
+  ip6tables -t mangle -F SS_GAM 2>/dev/null && ip6tables -t mangle -X SS_GAM 2>/dev/null
+  remove_fwmark_rule 2>/dev/null
+  /sbin/ip route del local 0.0.0.0/0 table 310 2>/dev/null
+}
+
+kill_all() {
+  kill -9 $(pidof $@) >/dev/null 2>&1
+}
+
+delay_start() {
+	echo "$(date): 执行启动延时 $delay 秒后再启动!" >> $LOG_FILE
+	sleep $1 && start >/dev/null 2>&1
+}
+
+boot() {
+  local delay=$(config_t_get global start_delay 0)
+  if [ "$delay" -gt 0 ]; then
+    delay_start $delay
+	touch /tmp/ssboot
+  else
+	start
+	touch /tmp/ssboot
+  fi
+  return 0
+}
+
+start() {
+  #/etc/init.d/v2ray stop
+  ! load_config && return 1
+  counts=`iptables -t nat -L SS 2>/dev/null| wc -l`
+  iptables -t nat -C PREROUTING -p tcp -j SS 2>/dev/null && [ $? -eq 0 ] && exit 0;
+  [ "$counts" -gt 0 ] && del_firewall_rule
+  add_vps_port
+  start_sslb
+  #防止并发开启服务
+  [ -f "$LOCK_FILE" ] && return 3
+  touch "$LOCK_FILE"
+  start_redir
+  start_dns
+  add_dnsmasq
+  add_rule
+  dns_hijack
+  /etc/init.d/dnsmasq restart >/dev/null 2>&1
+  auto_start
+  set_cru
+  rm -f "$LOCK_FILE"
+  echo "$(date): Shadowsocks已成功运行！" >> $LOG_FILE
+  return 0
+}
+
+stop() {
+	while [ -f "$LOCK_FILE" ]; do
+		sleep 1s
+	done
+	clean_log
+	echo "$(date): =============================================================================================" >> $LOG_FILE
+	echo "$(date):                                                                           开始关闭Shadowsocks" >> $LOG_FILE
+	echo "$(date): =============================================================================================" >> $LOG_FILE
+	echo "$(date): 删除所有防火墙规则..." >> $LOG_FILE
+	del_firewall_rule
+	del_vps_port
+	ipset -F ssoutput >/dev/null 2>&1 &
+	ipset -X ssoutput >/dev/null 2>&1 &
+	ipset -F cdn >/dev/null 2>&1 &
+	ipset -X cdn >/dev/null 2>&1 &
+	ipset -F gfwlist >/dev/null 2>&1 &
+	ipset -X gfwlist >/dev/null 2>&1 &		
+	echo "$(date): 关闭Shadowsocks相关服务..." >> $LOG_FILE
+	kill_all pdnsd cdns Pcap_DNSProxy ss-redir ss-tunnel ss-local ssr-redir ssr-tunnel ssr-local v2ray v2ctl dns2socks kcptun_client haproxy dns-forwarder chinadns dnsproxy dnsc
+	echo "$(date): 清理相关文件或缓存..." >> $LOG_FILE
+	unset $ssbin
+	rm -rf /var/run/pdnsd.pid
+	rm -rf /var/pdnsd/pdnsd.cache
+	rm -rf /var/run/haproxy.pid
+
+	plugin_nums=`ll /var/run/ss*plugin 2> /dev/null |wc -l`
+	[ "$plugin_nums" -gt 0 ] && {
+		for plugin in `ls /var/run/ss*plugin 2> /dev/null`
+		do
+			kill -9 $(pidof $(cat $plugin | sort | uniq)) >/dev/null 2>&1
+			rm -f $plugin
+		done
+	}
+	stop_dnsmasq
+	stop_cru
+	auto_stop
+	echo "$(date): Shadowsocks已成功关闭！" >> $LOG_FILE
+	sleep 1s
+}

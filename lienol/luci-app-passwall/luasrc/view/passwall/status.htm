@@ -1,0 +1,66 @@
+<%#
+ Copyright 2018 Lienol <lienol@qq.com>
+ Licensed to the public under the Apache License 2.0.
+-%>
+
+<style>
+#_ss_status_fieldset {
+	margin-bottom: 0px;
+}
+#_ss_status_table td {
+   border:none;
+}
+#_ss_status_table tr td:first-child {
+	width: 21%;
+	text-align:right;
+}
+#_ss_status_table tr td+td {
+	padding-left:30px
+}
+</style>
+<fieldset id="_ss_status_fieldset" class="cbi-section">
+	<legend><%:Running Status%></legend>
+	<table width="100%" cellspacing="10" id="_ss_status_table">
+		<tr>
+			<td><%:Transparent Proxy%></td>
+			<td id="_ss_redir_status">
+				<em><%:Collecting data...%></em>
+			</td>
+		</tr>
+		
+		<tr>
+			<td><%:Load Balancing%></td>
+			<td id="_haproxy_status">
+				<em><%:Collecting data...%></em>
+			</td>
+		</tr>
+		
+		<tr>
+			<td><%:Kcp Client%></td>
+			<td id="_kcp_status">
+				<em><%:Collecting data...%></em>
+			</td>
+		</tr>
+		
+		<tr>
+			<td><%:China Connection%></td>
+			<td id="_china_status">
+				<em><%:Collecting data...%></em>
+			</td>
+		</tr>
+		
+		<tr>
+			<td><%:Foreign Connection%></td>
+			<td id="_foreign_status">
+				<em><%:Collecting data...%></em>
+			</td>
+		</tr>
+		
+		<tr>
+			<td></td>
+			<td>
+				<a class="cbi-button cbi-input-button" href="http://www.ip111.cn/" target="_blank">IP111.cn</a>
+			</td>
+		</tr>
+	</table>
+</fieldset>

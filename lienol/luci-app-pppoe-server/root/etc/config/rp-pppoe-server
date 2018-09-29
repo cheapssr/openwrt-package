@@ -1,0 +1,20 @@
+
+config service
+	option localip '10.0.1.1'
+	option dns1 '10.0.1.1'
+	option dns2 '119.29.29.29'
+	option log '/var/log/pppoe-server.log'
+	option client_interface 'br-lan'
+	option count '50'
+	option mru '1492'
+	option mtu '1492'
+	option remoteip '10.0.1.100-254'
+	option enabled '0'
+	option export_interface 'none'
+
+config user
+	option enabled '1'
+	option ipaddress '*'
+	option username 'guest'
+	option password '123456'
+

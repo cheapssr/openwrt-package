@@ -1,0 +1,15 @@
+#!/bin/sh
+
+uci -q batch <<-EOF >/dev/null
+	delete ucitrack.@passwall[-1]
+	add ucitrack passwall
+	set ucitrack.@passwall[-1].init=passwall
+	commit ucitrack
+EOF
+
+/etc/init.d/haproxy disable && /etc/init.d/haproxy stop && rm /etc/init.d/haproxy
+/etc/init.d/kcptun disable && /etc/init.d/kcptun stop && rm /etc/init.d/kcptun
+/etc/init.d/shadowsocks-libev disable && /etc/init.d/shadowsocks-libev stop && rm /etc/init.d/shadowsocks-libev
+
+rm -f /tmp/luci-indexcache
+exit 0

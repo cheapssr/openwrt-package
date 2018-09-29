@@ -1,0 +1,11 @@
+#!/bin/sh
+
+uci -q batch <<-EOF >/dev/null
+	delete ucitrack.@rp-pppoe-relay[-1]
+	add ucitrack rp-pppoe-relay
+	set ucitrack.@rp-pppoe-relay[-1].init=rp-pppoe-relay
+	commit ucitrack
+EOF
+
+rm -f /tmp/luci-indexcache
+exit 0
